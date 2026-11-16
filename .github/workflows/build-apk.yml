@@ -1,0 +1,137 @@
+name: Build Cricket Manager Debug APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    name: Build Debug APK
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Extract uploaded project ZIP
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for z in *.zip; do
+            echo "Extracting $z..."
+            unzip -o "$z"
+          done
+
+      - name: Locate Android project directory
+        id: project
+        shell: bash
+        run: |
+          APP_GRADLE=$(find . -maxdepth 4 -path "*/app/build.gradle.kts" | head -n 1)
+          if [ -z "$APP_GRADLE" ]; then
+            echo "ERROR: Could not find app/build.gradle.kts. Please upload CricketManager-Android.zip to the repository."
+            ls -la
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$(dirname "$APP_GRADLE")")
+          echo "Found Android project at: $PROJECT_DIR"
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK and accept licenses
+        shell: bash
+        run: |
+          set +o pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER=$(find "$SDK_ROOT/cmdline-tools" -type f -name "sdkmanager" 2>/dev/null | head -n 1 || true)
+          fi
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "Downloading Android command-line tools..."
+            SDK_ROOT="$HOME/android-sdk"
+            mkdir -p "$SDK_ROOT/cmdline-tools"
+            echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+            echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+            curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/cmdline-tools.zip
+            unzip -q /tmp/cmdline-tools.zip -d "$SDK_ROOT/cmdline-tools"
+            mv "$SDK_ROOT/cmdline-tools/cmdline-tools" "$SDK_ROOT/cmdline-tools/latest"
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+            chmod +x "$SDKMANAGER"
+          fi
+
+          if [ -w "$SDK_ROOT" ]; then
+            yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
+            "$SDKMANAGER" --sdk_root="$SDK_ROOT" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          else
+            yes | sudo env "JAVA_HOME=$JAVA_HOME" "PATH=$PATH" "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
+            sudo env "JAVA_HOME=$JAVA_HOME" "PATH=$PATH" "$SDKMANAGER" --sdk_root="$SDK_ROOT" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          fi
+
+      - name: Set up Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.10.2'
+          cache-provider: 'basic'
+
+      - name: Ensure Gradle Wrapper is executable and ready
+        working-directory: ${{ steps.project.outputs.dir }}
+        shell: bash
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          chmod +x gradlew
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            gradle wrapper --gradle-version 8.10.2 --no-daemon
+          fi
+          ./gradlew --version
+
+      - name: Run unit tests
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: ./gradlew testDebugUnitTest --stacktrace --no-daemon
+
+      - name: Build Debug APK
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Verify APK output path
+        working-directory: ${{ steps.project.outputs.dir }}
+        shell: bash
+        run: |
+          APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK_PATH" ]; then
+            echo "ERROR: Expected APK not found at $APK_PATH"
+            find app/build/outputs -maxdepth 4 2>/dev/null || true
+            exit 1
+          fi
+          ls -lh "$APK_PATH"
+
+      - name: Upload Cricket Manager Debug APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Cricket-Manager-Debug-APK
+          path: ${{ steps.project.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Print build failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          echo "=== Gradle Build Failure Diagnostics ==="
+          echo "JAVA_HOME=$JAVA_HOME"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          java -version || true
+          ls -la || true
+          find . -maxdepth 3 -name "gradle-wrapper*" 2>/dev/null || true
+          find . -maxdepth 5 -path "*/build/reports/*" 2>/dev/null || true
